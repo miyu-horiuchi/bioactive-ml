@@ -9,3 +9,10 @@ figures/
 dist/
 build/
 .env
+.env.local
+.letta/
+
+# Frontend
+web/node_modules/
+web/.next/
+web/out/

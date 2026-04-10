@@ -1,28 +1,42 @@
 """
 Meal Shield — Expanded Food Peptide Data Collection
 
-Pulls bioactive peptide data from multiple databases to expand
-our training set from 25 → thousands of food-derived peptides.
+Pulls bioactive peptide data from multiple sources to build a
+large-scale training set of food-derived peptides.
 
 Sources:
-  1. AHTPDB (antihypertensive peptides) — webs.iiitd.edu.in/raghava/ahtpdb
-  2. Published ML datasets from literature (curated collections)
-  3. Expanded manual curation from key papers
+  1. Hand-curated peptides from published literature (high confidence)
+  2. BIOPEP-UWM database scraping (~5,600 peptides across 96 activities)
+  3. AHTPDB (antihypertensive peptides)
 
-Activity categories mapped to our meal-shield targets:
-  - ACE inhibitors → blood pressure (proxy for enzyme inhibition capability)
-  - DPP-4 inhibitors → blood sugar regulation
-  - Alpha-glucosidase inhibitors → sugar blocking
-  - Lipase inhibitors → fat blocking
-  - Antioxidant → general health
-  - Antimicrobial → food safety
+Activity categories (original + expanded):
+  Original:
+    - ACE inhibitors → blood pressure
+    - DPP-4 inhibitors → blood sugar regulation
+    - Alpha-glucosidase inhibitors → sugar blocking
+    - Lipase inhibitors → fat blocking
+    - Antioxidant → general health
+    - Bile acid binding → cholesterol
+    - Mineral binding → ion chelation
+  New from BIOPEP:
+    - Antimicrobial → food safety
+    - Anti-inflammatory → gut health
+    - Anticancer → chemopreventive
+    - Antithrombotic → cardiovascular
+    - Immunomodulating → immune support
+    - Renin inhibitor → blood pressure (complementary to ACE)
+    - Hypotensive → blood pressure (direct measurement)
+    - Opioid → pain/satiety modulation
 """
 
 import os
 import json
+import logging
 import requests
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -295,13 +309,27 @@ def ic50_to_pic50(ic50_uM):
     return -np.log10(ic50_uM * 1e-6)  # pIC50 = -log10(IC50 in M)
 
 
-def build_food_peptide_dataset(output_path="data/food_peptides.csv"):
+def build_food_peptide_dataset(output_path="data/food_peptides.csv",
+                                include_biopep=False,
+                                biopep_activities=None,
+                                biopep_max_details=None,
+                                include_dfbp=False,
+                                dfbp_activities=None):
     """
-    Build the combined food peptide dataset with all curated data.
+    Build the combined food peptide dataset.
+
+    Args:
+        output_path: Where to save the CSV.
+        include_biopep: If True, also scrape BIOPEP-UWM for additional peptides.
+        biopep_activities: Which BIOPEP activities to scrape (None = all).
+        biopep_max_details: Limit detail page fetches per activity (for testing).
+        include_dfbp: If True, also scrape DFBP for food-derived peptides.
+        dfbp_activities: Which DFBP activities to scrape (None = all).
     """
     all_peptides = []
 
-    sources = [
+    # --- Curated data (high-confidence, literature-sourced) ---
+    curated_sources = [
         ("ACE inhibitors", get_curated_ace_inhibitors()),
         ("DPP-4 inhibitors", get_curated_dpp4_inhibitors()),
         ("Alpha-glucosidase inhibitors", get_curated_alpha_glucosidase_inhibitors()),
@@ -312,56 +340,153 @@ def build_food_peptide_dataset(output_path="data/food_peptides.csv"):
         ("Inactive controls", get_inactive_peptides()),
     ]
 
-    for name, peptides in sources:
+    print("Curated peptides:")
+    for name, peptides in curated_sources:
         print(f"  {name}: {len(peptides)} peptides")
+        # Tag curated entries so we can prioritize them
+        for p in peptides:
+            p["data_source"] = "curated"
         all_peptides.extend(peptides)
 
-    # Convert to DataFrame
-    df = pd.DataFrame(all_peptides)
-    df["pIC50"] = df["ic50_uM"].apply(ic50_to_pic50)
+    curated_df = pd.DataFrame(all_peptides)
+
+    # --- BIOPEP-UWM scraped data ---
+    biopep_df = pd.DataFrame()
+    if include_biopep:
+        from scrape_biopep import scrape_all
+
+        print(f"\nScraping BIOPEP-UWM database...")
+        biopep_df = scrape_all(
+            activities=biopep_activities,
+            fetch_details=True,
+            max_details_per_activity=biopep_max_details,
+        )
+        if not biopep_df.empty:
+            biopep_df["data_source"] = "biopep"
+            # Drop rows without IC50 for regression training
+            has_ic50 = biopep_df["ic50_uM"].notna()
+            print(f"  BIOPEP total: {len(biopep_df)} ({has_ic50.sum()} with IC50)")
+            biopep_df = biopep_df[has_ic50].copy()
+
+    # --- DFBP scraped data ---
+    dfbp_df = pd.DataFrame()
+    if include_dfbp:
+        from fetch_external_dbs import scrape_dfbp_all
+
+        print(f"\nScraping DFBP database...")
+        dfbp_df = scrape_dfbp_all(dfbp_activities)
+        if not dfbp_df.empty:
+            has_ic50 = dfbp_df["ic50_uM"].notna()
+            print(f"  DFBP total: {len(dfbp_df)} ({has_ic50.sum()} with IC50)")
+
+    # --- Combine all sources ---
+    extra_dfs = [d for d in [biopep_df, dfbp_df] if not d.empty]
+    if extra_dfs:
+        # Align columns across all dataframes
+        all_cols = set(curated_df.columns)
+        for d in extra_dfs:
+            all_cols |= set(d.columns)
+        for col in all_cols:
+            if col not in curated_df.columns:
+                curated_df[col] = None
+            for d in extra_dfs:
+                if col not in d.columns:
+                    d[col] = None
+
+        df = pd.concat([curated_df] + extra_dfs, ignore_index=True)
+    else:
+        df = curated_df
+
+    # Compute derived columns
+    df["ic50_uM"] = pd.to_numeric(df["ic50_uM"], errors="coerce")
+    df["pIC50"] = df["ic50_uM"].apply(
+        lambda x: ic50_to_pic50(x) if pd.notna(x) and x > 0 else None
+    )
     df["length"] = df["sequence"].apply(len)
+    if "data_source" not in df.columns:
+        df["data_source"] = "curated"
 
     # Validate sequences (only standard amino acids)
     valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
     valid_mask = df["sequence"].apply(lambda s: all(aa in valid_aas for aa in s))
     df = df[valid_mask]
 
-    # Remove duplicates (keep lowest IC50 per sequence per activity)
-    df = df.sort_values("ic50_uM").drop_duplicates(
+    # Remove duplicates: prefer curated over biopep, then lowest IC50
+    df["_sort_priority"] = df["data_source"].map({"curated": 0, "biopep": 1}).fillna(2)
+    df = df.sort_values(["_sort_priority", "ic50_uM"]).drop_duplicates(
         subset=["sequence", "activity"], keep="first"
     )
+    df = df.drop(columns=["_sort_priority"])
+
+    # Drop BIOPEP-specific columns not needed for training
+    for col in ["biopep_id", "name"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
 
     # Save
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df.to_csv(output_path, index=False)
 
     # Summary
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"FOOD PEPTIDE DATASET SUMMARY")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
     print(f"Total peptides: {len(df)}")
     print(f"Unique sequences: {df['sequence'].nunique()}")
     print(f"\nBy activity:")
     print(df["activity"].value_counts().to_string())
+    print(f"\nBy data source:")
+    print(df["data_source"].value_counts().to_string())
     print(f"\nBy length:")
     print(df["length"].value_counts().sort_index().to_string())
-    print(f"\npIC50 range: {df['pIC50'].min():.2f} - {df['pIC50'].max():.2f}")
+    pIC50_valid = df["pIC50"].dropna()
+    if len(pIC50_valid) > 0:
+        print(f"\npIC50 range: {pIC50_valid.min():.2f} - {pIC50_valid.max():.2f}")
     print(f"\nSaved to: {output_path}")
 
     return df
 
 
 if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    parser = argparse.ArgumentParser(description="Build food peptide dataset")
+    parser.add_argument("--biopep", action="store_true",
+                        help="Include BIOPEP-UWM scraped data")
+    parser.add_argument("--biopep-activities", nargs="+", default=None,
+                        help="Specific BIOPEP activities to scrape")
+    parser.add_argument("--biopep-max-details", type=int, default=None,
+                        help="Max detail pages per activity (for testing)")
+    parser.add_argument("--dfbp", action="store_true",
+                        help="Include DFBP (food-derived bioactive peptides)")
+    parser.add_argument("--dfbp-activities", nargs="+", default=None,
+                        help="Specific DFBP activities to scrape")
+    parser.add_argument("--output", default="data/food_peptides.csv",
+                        help="Output CSV path")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("MEAL SHIELD -- Food Peptide Data Collection")
     print("=" * 60)
     print()
 
-    df = build_food_peptide_dataset()
+    df = build_food_peptide_dataset(
+        output_path=args.output,
+        include_biopep=args.biopep,
+        biopep_activities=args.biopep_activities,
+        biopep_max_details=args.biopep_max_details,
+        include_dfbp=args.dfbp,
+        dfbp_activities=args.dfbp_activities,
+    )
 
     # Show some examples
     print(f"\n--- Sample entries ---")
-    for activity in df["activity"].unique():
+    for activity in sorted(df["activity"].unique()):
         subset = df[df["activity"] == activity].head(3)
         for _, row in subset.iterrows():
-            print(f"  {row['sequence']:<20} {row['activity']:<25} IC50={row['ic50_uM']:>8.1f} uM  pIC50={row['pIC50']:.2f}  ({row['source']})")
+            ic50_str = f"{row['ic50_uM']:>8.1f}" if pd.notna(row['ic50_uM']) else "     N/A"
+            pic50_str = f"{row['pIC50']:.2f}" if pd.notna(row['pIC50']) else "N/A"
+            print(f"  {row['sequence']:<20} {row['activity']:<25} IC50={ic50_str} uM  pIC50={pic50_str}  ({row['source']})")

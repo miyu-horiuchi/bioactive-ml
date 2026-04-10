@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.git
+.github
+data/biopep_cache/
+data/external_cache/
+data/esm_cache.pt
+data/tda_cache.pt
+*.egg-info
+.env
+.venv
+venv
+node_modules

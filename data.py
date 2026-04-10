@@ -41,6 +41,16 @@ TARGETS = {
         "alt_ids": [],
         "description": "NHE3 — sodium absorption in gut"
     },
+    "ace_inhibitor": {
+        "chembl_id": "CHEMBL1808",       # Angiotensin-converting enzyme (ACE)
+        "alt_ids": ["CHEMBL4525"],       # ACE-2
+        "description": "ACE — angiotensin-converting enzyme (blood pressure)"
+    },
+    "dpp4_inhibitor": {
+        "chembl_id": "CHEMBL284",        # Dipeptidyl peptidase IV (DPP-4)
+        "alt_ids": [],
+        "description": "DPP-4 — dipeptidyl peptidase IV (blood sugar)"
+    },
 }
 
 
@@ -77,30 +87,61 @@ def fetch_chembl_activities(target_chembl_id, max_records=5000):
     return all_results
 
 
+def _convert_to_nM(value, units):
+    """Convert a bioactivity value to nM. Returns None if units unrecognized."""
+    conversions = {
+        "nM": 1.0,
+        "uM": 1e3,
+        "mM": 1e6,
+        "pM": 1e-3,
+        "M": 1e9,
+        "ug.mL-1": None,  # Needs MW — skip
+        "ug/mL": None,
+    }
+    factor = conversions.get(units)
+    if factor is None:
+        return None
+    return value * factor
+
+
 def process_chembl_data(activities, target_name):
     """Convert raw ChEMBL activities to a clean DataFrame."""
     records = []
+    skipped_units = {}
     for act in activities:
         smiles = act.get("canonical_smiles")
         value = act.get("standard_value")
         units = act.get("standard_units")
         std_type = act.get("standard_type")
 
-        if smiles and value and units == "nM":
-            try:
-                value_nM = float(value)
-                if value_nM > 0:
-                    pIC50 = 9 - np.log10(value_nM)  # Convert to pIC50
-                    records.append({
-                        "smiles": smiles,
-                        "value_nM": value_nM,
-                        "pIC50": pIC50,
-                        "target": target_name,
-                        "type": std_type,
-                        "chembl_id": act.get("molecule_chembl_id", ""),
-                    })
-            except (ValueError, TypeError):
-                continue
+        if not (smiles and value):
+            continue
+
+        try:
+            raw_value = float(value)
+        except (ValueError, TypeError):
+            continue
+
+        if raw_value <= 0:
+            continue
+
+        value_nM = _convert_to_nM(raw_value, units)
+        if value_nM is None:
+            skipped_units[units] = skipped_units.get(units, 0) + 1
+            continue
+
+        pIC50 = 9 - np.log10(value_nM)  # Convert to pIC50
+        records.append({
+            "smiles": smiles,
+            "value_nM": value_nM,
+            "pIC50": pIC50,
+            "target": target_name,
+            "type": std_type,
+            "chembl_id": act.get("molecule_chembl_id", ""),
+        })
+
+    if skipped_units:
+        print(f"  Skipped units for {target_name}: {skipped_units}")
 
     df = pd.DataFrame(records)
     if len(df) > 0:
@@ -145,45 +186,54 @@ def download_all_data(data_dir="data"):
 
 
 # ============================================================
-# 2. Food peptide data (BIOPEP-style curated set)
+# 2. Food peptide data — loaded from CSV
 # ============================================================
 
-# Curated set of known bioactive food peptides with activities
-# (From BIOPEP-UWM and published literature)
-KNOWN_FOOD_PEPTIDES = [
-    # Alpha-glucosidase inhibitors (from food sources)
-    {"sequence": "IPAVF",   "target": "alpha_glucosidase", "pIC50": 4.5, "source": "black bean"},
-    {"sequence": "AKSPLF",  "target": "alpha_glucosidase", "pIC50": 4.2, "source": "wheat gluten"},
-    {"sequence": "PPYIL",   "target": "alpha_glucosidase", "pIC50": 4.0, "source": "quinoa"},
-    {"sequence": "LRSELAAWSR", "target": "alpha_glucosidase", "pIC50": 3.8, "source": "rice"},
-    {"sequence": "GGSK",    "target": "alpha_glucosidase", "pIC50": 3.5, "source": "soybean"},
-    {"sequence": "EAK",     "target": "alpha_glucosidase", "pIC50": 3.3, "source": "wheat"},
-    {"sequence": "KLPGF",   "target": "alpha_glucosidase", "pIC50": 4.8, "source": "silk"},
-    {"sequence": "SVPA",    "target": "alpha_glucosidase", "pIC50": 3.9, "source": "egg"},
+def load_food_peptides(csv_path="data/food_peptides.csv", include_inactive=True):
+    """
+    Load food peptide data from the curated/scraped CSV.
+    Returns list of dicts compatible with build_dataset().
 
-    # Lipase inhibitors (from food sources)
-    {"sequence": "PAGNFLPP", "target": "lipase", "pIC50": 4.1, "source": "soybean"},
-    {"sequence": "GPVRGPFPIIV", "target": "lipase", "pIC50": 3.6, "source": "casein"},
-    {"sequence": "VFPS",    "target": "lipase", "pIC50": 3.4, "source": "tuna"},
-    {"sequence": "YALPHA",  "target": "lipase", "pIC50": 3.2, "source": "whey"},
+    Args:
+        csv_path: path to CSV file
+        include_inactive: if True, keep inactive peptides as negative examples
+                          (they get high IC50 / low pIC50 labels, which teaches
+                          the model what inactivity looks like)
+    """
+    if not os.path.exists(csv_path):
+        print(f"Warning: {csv_path} not found. Run fetch_peptides.py first.")
+        return []
 
-    # ACE inhibitors (well-studied, useful for transfer learning)
-    {"sequence": "IPP",     "target": "ace_inhibitor", "pIC50": 5.1, "source": "fermented milk (Calpis)"},
-    {"sequence": "VPP",     "target": "ace_inhibitor", "pIC50": 4.9, "source": "fermented milk (Calpis)"},
-    {"sequence": "LKP",     "target": "ace_inhibitor", "pIC50": 5.5, "source": "bonito"},
-    {"sequence": "IKP",     "target": "ace_inhibitor", "pIC50": 5.3, "source": "chicken"},
-    {"sequence": "VY",      "target": "ace_inhibitor", "pIC50": 4.6, "source": "sardine"},
-    {"sequence": "IY",      "target": "ace_inhibitor", "pIC50": 4.4, "source": "wheat"},
-    {"sequence": "LKPNM",   "target": "ace_inhibitor", "pIC50": 5.0, "source": "bonito"},
-    {"sequence": "FQKVVA",  "target": "ace_inhibitor", "pIC50": 4.7, "source": "chicken"},
+    df = pd.read_csv(csv_path)
+    peptides = []
+    n_inactive = 0
+    for _, row in df.iterrows():
+        if pd.isna(row.get("pIC50")) or pd.isna(row.get("sequence")):
+            continue
+        activity = row["activity"]
+        if activity == "inactive":
+            if not include_inactive:
+                continue
+            n_inactive += 1
+        peptides.append({
+            "sequence": row["sequence"],
+            "target": activity,
+            "pIC50": float(row["pIC50"]),
+            "source": row.get("source", "unknown"),
+        })
 
-    # DPP-4 inhibitors (blood sugar regulation)
-    {"sequence": "LPYPY",   "target": "dpp4_inhibitor", "pIC50": 4.3, "source": "gouda cheese"},
-    {"sequence": "IPAVFK",  "target": "dpp4_inhibitor", "pIC50": 4.0, "source": "milk"},
-    {"sequence": "WR",      "target": "dpp4_inhibitor", "pIC50": 4.5, "source": "various"},
-    {"sequence": "VAGTWY",  "target": "dpp4_inhibitor", "pIC50": 3.8, "source": "tuna"},
-    {"sequence": "FLQP",    "target": "dpp4_inhibitor", "pIC50": 4.1, "source": "wheat"},
-]
+    inactive_note = f" (including {n_inactive} inactive)" if n_inactive else ""
+    print(f"Loaded {len(peptides)} food peptides from {csv_path}{inactive_note}")
+    activities = {}
+    for p in peptides:
+        activities[p["target"]] = activities.get(p["target"], 0) + 1
+    for act, cnt in sorted(activities.items()):
+        print(f"  {act}: {cnt}")
+    return peptides
+
+
+# Backwards compatibility: load from CSV at import time if available
+KNOWN_FOOD_PEPTIDES = load_food_peptides()
 
 
 # ============================================================
@@ -293,31 +343,45 @@ def smiles_to_graph(smiles):
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def peptide_to_graph(sequence, use_residue_level=True):
+def peptide_to_graph(sequence, use_residue_level=True, esm_cache=None):
     """
     Convert a peptide sequence to a molecular graph.
 
     Two modes:
     - residue_level=True:  Each amino acid = one node (fast, good for short peptides)
     - residue_level=False: Each atom = one node (detailed, uses RDKit)
+
+    If esm_cache is provided, residue-level graphs get ESM-2 embeddings
+    concatenated to the physicochemical features (8 + 320 = 328 dim).
     """
     if use_residue_level:
-        return _peptide_residue_graph(sequence)
+        return _peptide_residue_graph(sequence, esm_cache=esm_cache)
     else:
         return _peptide_atom_graph(sequence)
 
 
-def _peptide_residue_graph(sequence):
-    """Residue-level graph: nodes = amino acids, edges = sequential + proximity."""
+def _peptide_residue_graph(sequence, esm_cache=None):
+    """
+    Residue-level graph: nodes = amino acids, edges = sequential + proximity.
+
+    If esm_cache is provided and contains the sequence, the 8-dim physicochemical
+    features are concatenated with 320-dim ESM-2 embeddings per residue (total: 328).
+    """
     if not all(aa in AA_FEATURES for aa in sequence):
         return None
 
-    # Node features
+    # Node features: physicochemical (8-dim)
     node_feats = []
     for aa in sequence:
         node_feats.append(AA_FEATURES[aa])
 
     x = torch.tensor(node_feats, dtype=torch.float)
+
+    # Concatenate ESM-2 embeddings if available (8 + 320 = 328 dim)
+    if esm_cache is not None and sequence in esm_cache:
+        esm_emb = esm_cache[sequence]  # (seq_len, 320)
+        if esm_emb.shape[0] == len(sequence):
+            x = torch.cat([x, esm_emb], dim=-1)
 
     # Edges: sequential bonds + skip connections (k=3)
     edge_indices = []
@@ -358,10 +422,19 @@ def _peptide_atom_graph(sequence):
 # 4. Build dataset
 # ============================================================
 
-def build_dataset(chembl_df, peptide_list=None, max_per_target=2000):
+def build_dataset(chembl_df, peptide_list=None, max_per_target=2000, esm_cache=None):
     """
     Build a combined dataset of molecular graphs with activity labels.
-    Returns list of Data objects.
+
+    Args:
+        chembl_df: DataFrame of ChEMBL bioactivity data.
+        peptide_list: List of peptide dicts with 'sequence', 'target', 'pIC50'.
+        max_per_target: Max compounds per ChEMBL target.
+        esm_cache: Dict mapping sequence -> ESM-2 embedding tensor.
+                   If provided, peptide node features are augmented (8 + 320 = 328 dim).
+
+    Returns:
+        (graphs, stats) tuple.
     """
     graphs = []
     stats = {}
@@ -381,11 +454,12 @@ def build_dataset(chembl_df, peptide_list=None, max_per_target=2000):
         stats[target_name] = count
         print(f"  {target_name}: {count} molecular graphs")
 
-    # Process food peptides
+    # Process food peptides (with optional ESM-2 embeddings)
     if peptide_list:
         pep_count = 0
         for pep in peptide_list:
-            graph = peptide_to_graph(pep["sequence"], use_residue_level=True)
+            graph = peptide_to_graph(pep["sequence"], use_residue_level=True,
+                                    esm_cache=esm_cache)
             if graph is not None:
                 graph.y = torch.tensor([pep["pIC50"]], dtype=torch.float)
                 graph.target_name = pep["target"]
@@ -395,6 +469,8 @@ def build_dataset(chembl_df, peptide_list=None, max_per_target=2000):
                 pep_count += 1
         stats["food_peptides"] = pep_count
         print(f"  food_peptides: {pep_count} peptide graphs")
+        if esm_cache:
+            print(f"  (ESM-2 embeddings: {sum(1 for p in peptide_list if p['sequence'] in esm_cache)}/{len(peptide_list)} sequences)")
 
     print(f"\nTotal dataset: {len(graphs)} graphs")
     return graphs, stats

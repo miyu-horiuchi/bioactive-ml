@@ -41,6 +41,8 @@ class MealShieldGNN(nn.Module):
                 "lipase",
                 "bile_acid_receptor",
                 "sodium_hydrogen_exchanger",
+                "ace_inhibitor",
+                "dpp4_inhibitor",
             ]
 
         self.target_names = target_names
@@ -175,6 +177,8 @@ class MealShieldGNN_TDA(nn.Module):
                 "lipase",
                 "bile_acid_receptor",
                 "sodium_hydrogen_exchanger",
+                "ace_inhibitor",
+                "dpp4_inhibitor",
             ]
 
         self.target_names = target_names
@@ -284,6 +288,8 @@ class MealShieldGIN(nn.Module):
                 "lipase",
                 "bile_acid_receptor",
                 "sodium_hydrogen_exchanger",
+                "ace_inhibitor",
+                "dpp4_inhibitor",
             ]
 
         self.target_names = target_names
