@@ -46,7 +46,7 @@ def pad_features(graph, target_dim):
     return graph
 
 
-def attach_tda_features(graphs, tda_cache, tda_dim=30):
+def attach_tda_features(graphs, tda_cache, tda_dim=42):
     """Attach precomputed TDA features to each graph."""
     success = 0
     for graph in graphs:
@@ -218,11 +218,12 @@ def main():
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    elif torch.backends.mps.is_available() and torch.__version__ >= "2.4":
+        # MPS scatter_reduce for GATConv is only available from 2.4+
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device} (PyTorch {torch.__version__})")
 
     # ---- Load data ----
     print("\n" + "=" * 60)
@@ -325,7 +326,7 @@ def main():
         test_tda, _ = attach_tda_features(test, tda_cache)
 
         tda_model = MealShieldGNN_TDA(
-            node_feature_dim=feature_dim, tda_feature_dim=30,
+            node_feature_dim=feature_dim, tda_feature_dim=42,
             hidden_dim=args.hidden_dim, num_heads=4, num_layers=3,
             dropout=0.2, target_names=targets,
         ).to(device)
@@ -389,7 +390,7 @@ def main():
             "lr": args.lr,
             "batch_size": args.batch_size,
             "tda_method": "statistics",
-            "tda_feature_dim": 30,
+            "tda_feature_dim": 42,
         },
         "targets": targets,
         "comparison": comparison,

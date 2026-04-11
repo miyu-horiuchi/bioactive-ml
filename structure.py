@@ -85,9 +85,12 @@ def _load_esmfold():
         _esmfold_available = True
         return _esmfold_model
 
-    except ImportError:
+    except ImportError as e:
         logger.error(
-            "ESMFold not available — install fair-esm: pip install fair-esm"
+            "ESMFold not available (%s). ESMFold depends on fair-esm + "
+            "omegaconf + openfold. On macOS CPU, openfold is hard to install; "
+            "use a Linux/CUDA environment for structure prediction.",
+            e,
         )
         _esmfold_available = False
         return None

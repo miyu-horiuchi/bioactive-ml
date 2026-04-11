@@ -8,6 +8,7 @@ model checkpoint is available.
 
 import os
 import logging
+from typing import Optional, List
 import torch
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -219,6 +220,14 @@ class PredictRequest(BaseModel):
     sequence: str = Field(
         ..., description="Peptide amino acid sequence", examples=["IPAVF"]
     )
+    n_samples: int = Field(
+        default=1,
+        ge=1,
+        le=200,
+        description="If >1, use MC Dropout to return per-target uncertainty "
+                    "(mean, std, 95% CI) by running this many stochastic "
+                    "forward passes.",
+    )
 
 
 class TargetPrediction(BaseModel):
@@ -226,6 +235,9 @@ class TargetPrediction(BaseModel):
     label: str
     pIC50: float
     IC50_uM: float
+    pIC50_std: Optional[float] = None
+    pIC50_ci95: Optional[List[float]] = None
+    n_samples: Optional[int] = None
 
 
 class PredictResponse(BaseModel):
@@ -337,7 +349,7 @@ def _demo_predict(sequence: str) -> list[TargetPrediction]:
     return predictions
 
 
-def _real_predict(sequence: str) -> list[TargetPrediction]:
+def _real_predict(sequence: str, n_samples: int = 1) -> list[TargetPrediction]:
     """Run actual model prediction."""
     from train import predict_peptide
 
@@ -347,6 +359,7 @@ def _real_predict(sequence: str) -> list[TargetPrediction]:
         device,
         feature_dim=state.get("feature_dim", 11),
         use_esm=state.get("esm_enabled", False),
+        n_samples=n_samples,
     )
     if results is None:
         raise HTTPException(422, "Could not build molecular graph for this sequence")
@@ -359,6 +372,9 @@ def _real_predict(sequence: str) -> list[TargetPrediction]:
                 label=TARGET_LABELS.get(target, target),
                 pIC50=vals["pIC50"],
                 IC50_uM=vals["IC50_uM"],
+                pIC50_std=vals.get("pIC50_std"),
+                pIC50_ci95=vals.get("pIC50_ci95"),
+                n_samples=vals.get("n_samples"),
             )
         )
     return predictions
@@ -408,7 +424,7 @@ async def predict(req: PredictRequest):
     if state["demo_mode"]:
         predictions = _demo_predict(sequence)
     else:
-        predictions = _real_predict(sequence)
+        predictions = _real_predict(sequence, n_samples=req.n_samples)
 
     return PredictResponse(
         sequence=sequence,
@@ -587,22 +603,53 @@ async def generate_peptides(req: GenerateRequest):
     except ImportError:
         raise HTTPException(503, "Generate module not installed")
 
+    model = state.get("model")
+    target_names = state.get("target_names")
+    feature_dim = state.get("feature_dim")
+    if model is None or target_names is None or feature_dim is None:
+        raise HTTPException(503, "Model not loaded")
+
     generators = {
         "genetic": generate_genetic,
         "mc": generate_mc,
         "enumerate": generate_enumerate,
     }
-
     generate_fn = generators[req.method]
-    candidates = generate_fn(
-        target=req.target,
-        length=req.length,
-        n_candidates=req.n_candidates,
-        top_k=req.top_k,
-    )
 
-    if candidates is None:
+    # generate_* returns List[Tuple[str, float]] — (sequence, pIC50)
+    try:
+        ranked = generate_fn(
+            model=model,
+            target=req.target,
+            target_names=target_names,
+            device=device,
+            feature_dim=feature_dim,
+            length=req.length,
+            n_candidates=req.n_candidates,
+        )
+    except Exception as e:
+        logger.exception("generate_%s failed", req.method)
+        raise HTTPException(500, f"Generation failed: {e}")
+
+    if not ranked:
         raise HTTPException(422, "Could not generate candidates for this target")
+
+    # Score developability properties for top_k candidates so the response
+    # matches GenerateCandidate's schema.
+    from properties import score_peptide
+    top = ranked[: req.top_k]
+    candidates = []
+    for seq, pic50 in top:
+        try:
+            props = score_peptide(seq) or {}
+        except Exception:
+            props = {}
+        candidates.append({
+            "sequence": seq,
+            "pIC50": float(pic50),
+            "IC50_uM": float(10 ** (6 - pic50)) if pic50 else float("nan"),
+            "properties": props,
+        })
 
     return GenerateResponse(
         target=req.target,

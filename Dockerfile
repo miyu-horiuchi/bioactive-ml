@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir \
     fastapi uvicorn[standard] pydantic && \
     pip install --no-cache-dir \
     rdkit-pypi ripser persim pandas numpy scikit-learn \
-    matplotlib networkx requests fair-esm
+    matplotlib networkx requests fair-esm omegaconf
 
 # Copy application code
 COPY *.py ./

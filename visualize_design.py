@@ -23,6 +23,7 @@ Usage:
 """
 
 import os
+import sys
 from collections import Counter
 from typing import Dict, List, Optional
 
@@ -242,8 +243,7 @@ def plot_pareto_front(
     if front_mask.sum() > 0:
         combined = front_xs + front_ys
         top_indices = np.where(front_mask)[0]
-        top_combined = combined[front_mask]
-        best_order = np.argsort(-top_combined)[:3]
+        best_order = np.argsort(-combined)[:3]
         for order_idx in best_order:
             ci = top_indices[order_idx]
             seq = candidates[ci].get("sequence", "")
@@ -740,11 +740,55 @@ if __name__ == "__main__":
         default=60,
         help="Number of synthetic demo candidates to generate (default: 60)",
     )
+    parser.add_argument(
+        "--input-csv",
+        type=str,
+        default=None,
+        help="Path to a design.py output CSV. If provided, real candidates are "
+             "loaded and demo mode is skipped.",
+    )
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="ace_inhibitor",
+        help="Target name to label figures with (default: ace_inhibitor).",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
-    print("MEAL SHIELD GNN -- Design Visualization (demo)")
+    if args.input_csv:
+        print("MEAL SHIELD GNN -- Design Visualization")
+    else:
+        print("MEAL SHIELD GNN -- Design Visualization (demo)")
     print("=" * 60)
+
+    if args.input_csv:
+        import pandas as pd
+        df = pd.read_csv(args.input_csv)
+        real_candidates = []
+        for _, row in df.iterrows():
+            props = {
+                "toxicity": float(row.get("toxicity", 0.0)),
+                "hemolysis": float(row.get("hemolysis", 0.0)),
+                "solubility": float(row.get("solubility", 0.0)),
+                "permeability": float(row.get("permeability", 0.0)),
+                "stability": float(row.get("stability", 0.0)),
+                "bitterness": float(row.get("bitterness", 0.0)),
+            }
+            real_candidates.append({
+                "sequence": str(row["sequence"]),
+                "pIC50": float(row.get("pIC50", 0.0)),
+                "IC50_uM": float(row.get("IC50_uM", 0.0)),
+                "properties": props,
+                "overall_score": float(row.get("developability", row.get("composite", 0.0))),
+                "pareto_rank": int(row.get("rank", 1)),
+            })
+        print(f"Loaded {len(real_candidates)} candidates from {args.input_csv}")
+        paths = create_design_report_figures(
+            real_candidates, args.target, args.output_dir
+        )
+        print(f"\nAll {len(paths)} figures saved to {args.output_dir}/")
+        sys.exit(0)
 
     # Generate synthetic candidate data for demonstration
     np.random.seed(42)

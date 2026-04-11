@@ -484,12 +484,17 @@ def cross_validate(graphs, target_names, device, n_folds=5,
 
 
 def predict_peptide(model, sequence, target_names, device, feature_dim=11,
-                    use_esm=None):
+                    use_esm=None, n_samples=1):
     """Predict activity profile for a new peptide sequence.
 
-    If use_esm is None, it's inferred from feature_dim (>11 implies the model
-    was trained with ESM-2 embeddings). When enabled, the ESM-2 per-residue
-    embedding is computed on the fly so inference matches training.
+    If ``use_esm`` is None, it's inferred from feature_dim (>11 implies the
+    model was trained with ESM-2 embeddings). When enabled, the ESM-2
+    per-residue embedding is computed on the fly so inference matches training.
+
+    If ``n_samples > 1``, MC Dropout is used for uncertainty quantification:
+    dropout layers are kept active and ``n_samples`` forward passes are run.
+    The returned dict then includes ``pIC50_std`` and a 95% confidence
+    interval in addition to the point prediction.
     """
     from data import peptide_to_graph
 
@@ -510,6 +515,48 @@ def predict_peptide(model, sequence, target_names, device, feature_dim=11,
     graph = pad_features(graph, feature_dim)
     graph.batch = torch.zeros(graph.x.size(0), dtype=torch.long, device=device)
     graph = graph.to(device)
+
+    if n_samples > 1:
+        # MC Dropout: put the whole model in inference mode (train(False)),
+        # then re-enable only the dropout layers so we get stochastic forward
+        # passes for uncertainty estimation.
+        model.train(False)
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.train(True)
+
+        samples = {t: [] for t in target_names}
+        with torch.no_grad():
+            for _ in range(n_samples):
+                preds = model(graph)
+                for t in target_names:
+                    if t in preds:
+                        samples[t].append(preds[t].item())
+
+        results = {}
+        for target in target_names:
+            vals = samples[target]
+            if not vals:
+                continue
+            arr = np.array(vals)
+            mean = float(arr.mean())
+            std = float(arr.std())
+            lo = mean - 1.96 * std
+            hi = mean + 1.96 * std
+            if mean > 0:
+                ic50_uM = (10 ** (9 - mean)) / 1000
+            else:
+                ic50_uM = float("inf")
+            results[target] = {
+                "pIC50": round(mean, 3),
+                "pIC50_std": round(std, 3),
+                "pIC50_ci95": [round(lo, 3), round(hi, 3)],
+                "IC50_uM": round(ic50_uM, 2),
+                "n_samples": n_samples,
+            }
+        # Restore all modules to inference mode before returning.
+        model.train(False)
+        return results
 
     model.eval()
     with torch.no_grad():

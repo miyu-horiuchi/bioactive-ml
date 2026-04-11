@@ -361,10 +361,9 @@ def load_model(
         print("Train the model first:  python train.py --esm --multitask")
         sys.exit(1)
 
+    # MPS doesn't implement scatter_reduce for GAT — force CPU on macOS unless CUDA is present.
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
     else:
         device = torch.device("cpu")
 
