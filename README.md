@@ -1,221 +1,141 @@
-# Meal Shield
+# Meal Shield -- AI-Guided Food Peptide Bioactivity Prediction and Design
 
-**Multi-task Graph Neural Network + Topological Data Analysis for predicting food peptide bioactivity.**
-
-Meal Shield identifies natural food peptides that block sugar and fat digestion by predicting their inhibitory activity against six digestive enzyme targets. It combines Graph Attention Networks (GAT) for local molecular structure with Persistent Homology (TDA) for global molecular topology — rings, cavities, and binding pockets that GNNs alone cannot capture. Includes per-residue explainability via attention weights and integrated gradients.
-
-## Why This Matters
-
-Bioactive peptides in everyday foods (milk, fish, soy, rice) can naturally inhibit digestive enzymes — the same mechanism used by pharmaceutical drugs like acarbose and orlistat. Identifying these peptides computationally enables:
-
-- **Functional food design** — formulate meals that modulate sugar/fat absorption
-- **Drug discovery** — food-derived peptides as starting points for safer therapeutics
-- **Personalized nutrition** — predict which peptides target which metabolic pathways
-
-## Targets
-
-| Target | ChEMBL ID | Mechanism |
-|--------|-----------|-----------|
-| Alpha-glucosidase | CHEMBL4979 | Blocks starch → glucose conversion |
-| Pancreatic lipase | CHEMBL4822 | Blocks dietary fat digestion |
-| FXR bile acid receptor | CHEMBL4829 | Modulates bile acid signaling |
-| NHE3 exchanger | CHEMBL4145 | Regulates gut sodium absorption |
-| ACE inhibitor | CHEMBL1808 | Angiotensin-converting enzyme (blood pressure) |
-| DPP-4 inhibitor | CHEMBL284 | Dipeptidyl peptidase IV (blood sugar) |
+Multi-task Graph Attention Network combining ESM-2 protein language model embeddings with topological data analysis to predict food peptide bioactivity against six digestive enzyme targets. Includes an AI-guided design pipeline (genetic algorithm / Monte Carlo) that generates novel peptide candidates, scores them on safety and developability properties, applies Pareto-optimal filtering, and predicts 3D structures via ESMFold. Trained on 15,000+ peptides aggregated from ChEMBL, BIOPEP-UWM, DFBP, and curated literature.
 
 ## Architecture
 
 ```
-Peptide sequence (e.g. "IPAVF")
-        │
-        ├──► GNN Branch (3× GAT layers, 4 attention heads)
-        │    └── Atom/residue graph → local chemistry features (256d)
-        │
-        ├──► TDA Branch (Persistent Homology)
-        │    └── 3D coords → Ripser → persistence statistics + cocycles (42d → 64d)
-        │
-        └──► Fusion → Shared trunk (128d) → 4 task-specific heads → pIC50 predictions
+Data Sources          Model                    Applications
+─────────────       ─────────────            ─────────────
+ChEMBL (8,794)  →   ESM-2 (320-dim)     →   Bioactivity Prediction
+BIOPEP (3,258)  →   + GAT (3-layer)     →   Peptide Design (GA/MC)
+DFBP (3,724)    →   Multi-task heads    →   Property Scoring
+Curated (212)   →   (6 targets)         →   3D Structure (ESMFold)
 ```
 
-**GNN branch** learns local chemical neighborhoods — which atoms bond to what, aromatic rings, charge distributions.
+## Results
 
-**TDA branch** captures global shape — the size and persistence of molecular rings (H1), cavities and binding pockets (H2), and spatial extent of topological features via cocycle analysis.
+| Target | R² | RMSE | Test N |
+|---|---|---|---|
+| alpha_glucosidase | 0.831 | 0.633 | 275 |
+| dpp4_inhibitor | 0.745 | 0.872 | 519 |
+| ace_inhibitor | 0.676 | 0.735 | 671 |
+| lipase | 0.580 | 0.859 | 408 |
+| sodium_hydrogen_exchanger | 0.425 | 0.903 | 77 |
+| bile_acid_receptor | 0.398 | 0.553 | 400 |
 
-## Dataset
-
-- **ChEMBL**: Small-molecule inhibitors with measured IC50 values for each target
-- **BIOPEP-UWM**: Thousands of bioactive peptides scraped programmatically (ACE inhibitors alone have 3,000+ entries)
-- **Curated food peptides**: 212 hand-curated bioactive peptides from literature
-- Expand the dataset: `python expand_dataset.py` (scrapes BIOPEP and merges with existing data)
-- Source: `data/food_peptides.csv` (curated), `data/food_peptides_expanded.csv` (after expansion)
-
-## Installation
+## Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/miyuhoriuchi/bioactive-ml.git
-cd bioactive-ml
-
-# Install dependencies
 pip install -e .
-
-# For the web API server
-pip install -e ".[server]"
+python fetch_peptides.py --biopep --dfbp    # Expand dataset
+python train.py --esm --multitask           # Train
+python design.py --target ace_inhibitor --method genetic --length 5  # Design
+python -m uvicorn server:app --port 8000    # API
+cd web && npm run dev                       # Frontend
 ```
-
-### Requirements
-
-- Python 3.10+
-- PyTorch 2.0+
-- CUDA (optional, for GPU training)
-
-## Training
-
-### Train the base GNN model
-
-```bash
-python train.py
-```
-
-This will:
-1. Download activity data from ChEMBL (cached to `data/chembl_combined.csv`)
-2. Build molecular graphs for small molecules and peptides
-3. Train per-target with early stopping
-4. Save checkpoint to `checkpoints/meal_shield_gnn.pt`
-5. Print evaluation metrics (R², RMSE) and sample predictions
-
-### Train and compare GNN vs GNN+TDA
-
-```bash
-python train_tda.py
-```
-
-Trains both models side-by-side and reports the performance delta — this is the key result showing whether topological features improve predictions.
-
-### Run full evaluation pipeline
-
-```bash
-python evaluate.py
-```
-
-Trains both models, saves checkpoints, and writes evaluation results to `RESULTS.md`.
-
-## Inference
-
-```python
-from model import MealShieldGNN
-from train import predict_peptide
-import torch
-
-device = torch.device("cpu")
-model = MealShieldGNN(target_names=["alpha_glucosidase", "lipase", "bile_acid_receptor", "sodium_hydrogen_exchanger"])
-model.load_state_dict(torch.load("checkpoints/meal_shield_gnn.pt", map_location=device))
-
-results = predict_peptide(model, "IPAVF", model.target_names, device)
-for target, pred in results.items():
-    print(f"{target}: pIC50={pred['pIC50']}, IC50={pred['IC50_uM']} uM")
-```
-
-## Web Interface
-
-The web interface consists of a FastAPI backend + Next.js frontend.
-
-### Start the API server
-
-```bash
-uvicorn server:app --reload --port 8000
-```
-
-API endpoints:
-- `GET /health` — server status and model info
-- `POST /api/predict` — predict peptide bioactivity
-- `POST /api/tda` — compute topological features
-- `POST /api/explain` — per-residue attribution (attention weights or integrated gradients)
-- `POST /api/structure` — generate 3D PDB structure for visualization
-- `GET /api/targets` — list available prediction targets
-
-### Start the frontend
-
-```bash
-cd web
-npm install
-npm run dev
-```
-
-Open http://localhost:3000 to use the interactive prediction interface.
-
-### Deployment
-
-- **Frontend**: Deploy `web/` to [Vercel](https://vercel.com) — set `BACKEND_URL` environment variable
-- **Backend**: Deploy to [Modal](https://modal.com) or [Railway](https://railway.app) for GPU inference
-
-## Explainability
-
-The interpretability layer shows which amino acids drive each prediction:
-
-```python
-from interpret import explain_prediction
-import torch
-
-# After loading a trained model...
-result = explain_prediction(model, "IPAVF", "lipase", device, method="attention")
-for r in result["top_residues"][:3]:
-    print(f"  {r['residue']} (pos {r['position']+1}): {r['score']:.1%} importance")
-```
-
-Two methods available:
-- **Attention-based** (fast): Aggregates GAT attention weights across layers and heads
-- **Integrated gradients** (principled): Path integral from zero baseline to actual input features
-
-The web interface visualizes attributions as a heatmap on the 3D molecular structure — brighter/larger residues had more influence on the prediction.
-
-## Expanding the Dataset
-
-The BIOPEP-UWM scraper can pull thousands of bioactive peptides:
-
-```bash
-# Full scrape (all 9 activity categories, fetches IC50 from detail pages)
-python expand_dataset.py
-
-# Quick test (50 details per activity)
-python expand_dataset.py --quick
-
-# Specific activities only
-python expand_dataset.py --activities ace_inhibitor dpp4_inhibitor
-```
-
-This merges BIOPEP data with the existing curated dataset, deduplicates, and outputs `data/food_peptides_expanded.csv`.
 
 ## Project Structure
 
+| File | Description |
+|---|---|
+| `data.py` | ChEMBL data pipeline and molecular graph construction |
+| `model.py` | Multi-task GAT / GIN model architectures |
+| `train.py` | Training loop with masked multi-task loss and cross-validation |
+| `train_tda.py` | GNN + persistent homology comparison training |
+| `evaluate.py` | Full evaluation pipeline with checkpoint saving and results export |
+| `baselines.py` | Random Forest and Ridge Regression baselines using fingerprints |
+| `esm_embeddings.py` | ESM-2 per-residue embeddings (320-dim) with disk caching |
+| `topology.py` | Persistent homology features via Ripser (rings, cavities, tunnels) |
+| `server.py` | FastAPI backend with prediction, explanation, and structure endpoints |
+| `visualize.py` | Dataset overview, t-SNE, radar charts, attention heatmaps |
+| `visualize_design.py` | Design pipeline plots: Pareto fronts, property radars, sequence logos |
+| `generate.py` | Peptide sequence generator (Monte Carlo, genetic algorithm, enumeration) |
+| `properties.py` | Developability scoring: toxicity, hemolysis, solubility, stability, bitterness |
+| `pareto.py` | Multi-objective Pareto front extraction and diversity-aware ranking |
+| `structure.py` | ESMFold 3D structure prediction with PDB output and pLDDT scoring |
+| `design.py` | End-to-end design orchestrator (generate -> score -> filter -> rank -> structure) |
+| `fetch_peptides.py` | Multi-source data collection pipeline (literature, BIOPEP, DFBP) |
+| `scrape_biopep.py` | BIOPEP-UWM web scraper with two-phase enrichment and caching |
+| `fetch_external_dbs.py` | DFBP and Peptipedia integration for external peptide databases |
+| `interpret.py` | Per-residue attribution via GAT attention weights and integrated gradients |
+
+## Design Pipeline
+
+The design pipeline generates novel food peptides optimized for a target enzyme. It chains five stages: candidate generation, developability scoring, bioactivity prediction, Pareto-optimal selection, and 3D structure prediction.
+
+```bash
+python design.py --target ace_inhibitor --method genetic --length 5 --top-k 5
 ```
-bioactive-ml/
-├── model.py             # GNN architectures (GAT, GAT+TDA, GIN)
-├── data.py              # ChEMBL data pipeline + molecular graph construction
-├── topology.py          # Persistent homology (TDA) feature computation
-├── interpret.py         # Explainability (attention attribution, integrated gradients)
-├── train.py             # Training script (multi-task learning)
-├── train_tda.py         # GNN vs GNN+TDA comparison
-├── evaluate.py          # Full evaluation pipeline with results output
-├── expand_dataset.py    # BIOPEP-UWM scraper integration + dataset merging
-├── scrape_biopep.py     # BIOPEP-UWM web scraper (17 activity categories)
-├── fetch_peptides.py    # Curated food peptide dataset (212 peptides)
-├── visualize.py         # Molecular graph visualization
-├── server.py            # FastAPI backend (prediction, TDA, explain, 3D structure)
-├── web/                 # Next.js frontend (3Dmol.js viewer, attribution heatmap)
-├── data/
-│   └── food_peptides.csv
-├── checkpoints/         # Saved model weights (created by training)
-└── pyproject.toml
+
+Sample output (ACE inhibitor, genetic algorithm, length 5):
+
+| Rank | Sequence | pIC50 | IC50 (uM) | Solubility | Toxicity | Bitterness |
+|---|---|---|---|---|---|---|
+| 1 | KTRDK | 5.578 | 2.64 | 1.0 | 0.0 | 0.0 |
+| 2 | VRSCR | 5.561 | 2.75 | 1.0 | 0.1 | 0.04 |
+| 3 | KSRTR | 5.576 | 2.66 | 1.0 | 0.2 | 0.0 |
+| 4 | PRRTK | 5.589 | 2.58 | 1.0 | 0.2 | 0.0 |
+| 5 | VRDRK | 5.569 | 2.70 | 1.0 | 0.0 | 0.0 |
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Server health check |
+| GET | `/api/targets` | List available enzyme targets |
+| POST | `/api/predict` | Predict bioactivity (pIC50) for a peptide sequence |
+| POST | `/api/explain` | Residue-level attribution scores |
+| POST | `/api/tda` | Topological data analysis features |
+| POST | `/api/structure` | 3D structure prediction (PDB format) |
+| POST | `/api/properties` | Developability property scoring |
+| POST | `/api/generate` | Generate candidate peptides for a target |
+
+Start the server:
+
+```bash
+pip install -e ".[server]"
+python -m uvicorn server:app --port 8000
+```
+
+## Web UI
+
+The Next.js frontend lives in `web/` and provides an interactive interface for peptide analysis:
+
+- Peptide sequence input with real-time bioactivity prediction across all six targets
+- 3D molecule viewer powered by 3Dmol.js for visualizing predicted structures
+- Attention heatmaps showing per-residue contributions to each prediction
+- Design pipeline integration for generating and ranking novel candidates
+
+```bash
+cd web && npm install && npm run dev
+```
+
+## Data Sources
+
+| Source | Peptides | Description |
+|---|---|---|
+| [ChEMBL](https://www.ebi.ac.uk/chembl/) | 8,794 | Curated bioassay data with IC50/Ki values |
+| [BIOPEP-UWM](https://biochemia.uwm.edu.pl/biopep-uwm/) | 3,258 | Bioactive peptides across 19 activity categories |
+| [DFBP](http://www.omic.tech/dfbpapp/) | 3,724 | Food-derived bioactive peptides with IC50 values |
+| Curated literature | 212 | Hand-curated peptides from published studies |
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
 ```
 
 ## Citation
 
-If you use this work, please cite:
-
-```
-Meal Shield: Multi-task GNN with Topological Data Analysis
-for Food Peptide Bioactivity Prediction
+```bibtex
+@article{hong2026ai,
+  title={AI-Designed Peptides as Tools for Biochemistry},
+  author={Hong, L. and Vincoff, S. and Chatterjee, P.},
+  journal={Biochemistry},
+  year={2026}
+}
 ```
 
 ## License
