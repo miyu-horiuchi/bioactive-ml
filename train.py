@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from model import MealShieldGNN, MealShieldGIN
 from data import download_all_data, build_dataset, KNOWN_FOOD_PEPTIDES, load_food_peptides, TARGETS
 
-NUM_WORKERS = min(4, os.cpu_count() or 1)
+NUM_WORKERS = int(os.environ.get("DATALOADER_WORKERS", min(4, os.cpu_count() or 1)))
 
 
 def set_seed(seed=42):
@@ -612,8 +612,9 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # torch.compile for ~30% speedup (PyTorch 2.x)
-    if hasattr(torch, "compile"):
+    # torch.compile for ~30% speedup (PyTorch 2.x). Set TORCH_COMPILE=0 to
+    # disable (useful on CPU where it can be slower or trigger crashes).
+    if hasattr(torch, "compile") and os.environ.get("TORCH_COMPILE", "1") != "0":
         try:
             model = torch.compile(model)
             print("torch.compile() enabled")

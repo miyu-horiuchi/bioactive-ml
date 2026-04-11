@@ -109,26 +109,40 @@ def _load_models():
                     feat_dim, esm_enabled, targets)
 
     if os.path.exists(TDA_CHECKPOINT_PATH):
-        feat_dim = state.get("feature_dim", 11)
-        targets = state.get("target_names", TARGET_NAMES)
+        try:
+            tda_ckpt = torch.load(TDA_CHECKPOINT_PATH, map_location=device, weights_only=False)
+            if isinstance(tda_ckpt, dict) and "model_state_dict" in tda_ckpt:
+                tda_state = tda_ckpt["model_state_dict"]
+                tda_feat_dim = tda_ckpt.get("feature_dim")
+                tda_targets = tda_ckpt.get("target_names", TARGET_NAMES)
+                tda_hidden = tda_ckpt.get("hidden_dim", 128)
+            else:
+                tda_state = tda_ckpt
+                tda_feat_dim = None
+                tda_targets = TARGET_NAMES
+                tda_hidden = 128
 
-        tda_model = MealShieldGNN_TDA(
-            node_feature_dim=feat_dim,
-            tda_feature_dim=42,
-            hidden_dim=128,
-            num_heads=4,
-            num_layers=3,
-            target_names=targets,
-        )
-        tda_ckpt = torch.load(TDA_CHECKPOINT_PATH, map_location=device, weights_only=False)
-        if isinstance(tda_ckpt, dict) and "model_state_dict" in tda_ckpt:
-            tda_model.load_state_dict(tda_ckpt["model_state_dict"])
-        else:
-            tda_model.load_state_dict(tda_ckpt)
-        tda_model.to(device)
-        tda_model.eval()
-        state["tda_model"] = tda_model
-        logger.info("Loaded GNN+TDA model")
+            if tda_feat_dim is None:
+                ip = tda_state.get("input_proj.weight")
+                tda_feat_dim = int(ip.shape[1]) if ip is not None else 11
+
+            tda_model = MealShieldGNN_TDA(
+                node_feature_dim=tda_feat_dim,
+                tda_feature_dim=42,
+                hidden_dim=tda_hidden,
+                num_heads=4,
+                num_layers=3,
+                target_names=tda_targets,
+            )
+            tda_model.load_state_dict(tda_state)
+            tda_model.to(device)
+            tda_model.eval()
+            state["tda_model"] = tda_model
+            state["tda_feature_dim"] = tda_feat_dim
+            logger.info("Loaded GNN+TDA model (feature_dim=%d)", tda_feat_dim)
+        except Exception as e:
+            logger.warning("Skipping TDA model load: %s", e)
+            state["tda_model"] = None
 
 
 @asynccontextmanager
@@ -162,6 +176,43 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
+
+class PropertiesRequest(BaseModel):
+    sequence: str = Field(
+        ..., description="Peptide amino acid sequence", examples=["LIWKL"]
+    )
+
+
+class PropertiesResponse(BaseModel):
+    sequence: str
+    properties: dict
+
+
+class GenerateRequest(BaseModel):
+    target: str = Field(
+        ..., description="Target name", examples=["ace_inhibitor"]
+    )
+    method: str = Field(
+        default="genetic",
+        description="Generation method: 'genetic', 'mc', or 'enumerate'",
+    )
+    length: int = Field(default=5, description="Peptide length")
+    n_candidates: int = Field(default=50, description="Number of candidates to generate")
+    top_k: int = Field(default=10, description="Number of top candidates to return")
+
+
+class GenerateCandidate(BaseModel):
+    sequence: str
+    pIC50: float
+    IC50_uM: float
+    properties: dict
+
+
+class GenerateResponse(BaseModel):
+    target: str
+    method: str
+    candidates: list
 
 
 class PredictRequest(BaseModel):
@@ -331,8 +382,22 @@ async def health():
 
 @app.get("/api/targets")
 async def list_targets():
+    try:
+        from data import TARGETS as DATA_TARGETS
+        descriptions = {
+            name: info.get("description", "")
+            for name, info in DATA_TARGETS.items()
+        }
+    except ImportError:
+        descriptions = {}
+
     return [
-        {"name": name, "label": TARGET_LABELS[name]} for name in TARGET_NAMES
+        {
+            "name": name,
+            "label": TARGET_LABELS[name],
+            "description": descriptions.get(name, ""),
+        }
+        for name in TARGET_NAMES
     ]
 
 
@@ -478,6 +543,71 @@ async def explain(req: ExplainRequest):
             ResidueAttribution(**r) for r in result["top_residues"]
         ],
         demo_mode=state["demo_mode"],
+    )
+
+
+@app.post("/api/properties", response_model=PropertiesResponse)
+async def score_properties(req: PropertiesRequest):
+    """Score a peptide on developability properties (toxicity, solubility, etc.)."""
+    sequence = _validate_sequence(req.sequence)
+
+    try:
+        from properties import score_peptide
+    except ImportError:
+        raise HTTPException(503, "Properties module not installed")
+
+    props = score_peptide(sequence)
+    if props is None:
+        raise HTTPException(422, "Could not score properties for this sequence")
+
+    return PropertiesResponse(sequence=sequence, properties=props)
+
+
+@app.post("/api/generate", response_model=GenerateResponse)
+async def generate_peptides(req: GenerateRequest):
+    """Generate candidate peptides for a given target."""
+    if req.target not in TARGET_NAMES:
+        raise HTTPException(400, f"Unknown target: {req.target}. Available: {TARGET_NAMES}")
+
+    valid_methods = ("genetic", "mc", "enumerate")
+    if req.method not in valid_methods:
+        raise HTTPException(400, f"Invalid method: {req.method}. Available: {list(valid_methods)}")
+
+    if req.length < 2 or req.length > 15:
+        raise HTTPException(400, "length must be between 2 and 15")
+
+    if req.n_candidates < 1 or req.n_candidates > 500:
+        raise HTTPException(400, "n_candidates must be between 1 and 500")
+
+    if req.top_k < 1 or req.top_k > req.n_candidates:
+        raise HTTPException(400, f"top_k must be between 1 and {req.n_candidates}")
+
+    try:
+        from generate import generate_mc, generate_genetic, generate_enumerate
+    except ImportError:
+        raise HTTPException(503, "Generate module not installed")
+
+    generators = {
+        "genetic": generate_genetic,
+        "mc": generate_mc,
+        "enumerate": generate_enumerate,
+    }
+
+    generate_fn = generators[req.method]
+    candidates = generate_fn(
+        target=req.target,
+        length=req.length,
+        n_candidates=req.n_candidates,
+        top_k=req.top_k,
+    )
+
+    if candidates is None:
+        raise HTTPException(422, "Could not generate candidates for this target")
+
+    return GenerateResponse(
+        target=req.target,
+        method=req.method,
+        candidates=candidates,
     )
 
 
