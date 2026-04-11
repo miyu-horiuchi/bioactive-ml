@@ -14,7 +14,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.model_selection import train_test_split
 
 from model import MealShieldGNN, MealShieldGIN
-from data import download_all_data, build_dataset, KNOWN_FOOD_PEPTIDES, load_food_peptides
+from data import download_all_data, build_dataset, KNOWN_FOOD_PEPTIDES, load_food_peptides, TARGETS
 
 
 def set_seed(seed=42):
@@ -474,11 +474,27 @@ def cross_validate(graphs, target_names, device, n_folds=5,
     return results
 
 
-def predict_peptide(model, sequence, target_names, device, feature_dim=11):
-    """Predict activity profile for a new peptide sequence."""
+def predict_peptide(model, sequence, target_names, device, feature_dim=11,
+                    use_esm=None):
+    """Predict activity profile for a new peptide sequence.
+
+    If use_esm is None, it's inferred from feature_dim (>11 implies the model
+    was trained with ESM-2 embeddings). When enabled, the ESM-2 per-residue
+    embedding is computed on the fly so inference matches training.
+    """
     from data import peptide_to_graph
 
-    graph = peptide_to_graph(sequence, use_residue_level=True)
+    if use_esm is None:
+        use_esm = feature_dim > 11
+
+    esm_cache = None
+    if use_esm:
+        from esm_embeddings import get_esm_embedding
+        emb = get_esm_embedding(sequence)
+        if emb is not None:
+            esm_cache = {sequence: emb}
+
+    graph = peptide_to_graph(sequence, use_residue_level=True, esm_cache=esm_cache)
     if graph is None:
         return None
 
@@ -540,6 +556,15 @@ def main():
     chembl_data = download_all_data(data_dir="data")
     peptides = load_food_peptides()
 
+    # Keep only peptides whose target is one of the 6 ChEMBL-backed targets.
+    # Drops antioxidant/bile_acid_binding/inactive/mineral_binding heads
+    # which have too few samples to train meaningful regressors.
+    allowed_targets = set(TARGETS.keys())
+    before = len(peptides)
+    peptides = [p for p in peptides if p["target"] in allowed_targets]
+    print(f"Filtered peptides: {before} -> {len(peptides)} "
+          f"(kept targets: {sorted(allowed_targets)})")
+
     # ESM-2 embeddings (optional, adds 320-dim per-residue features)
     esm_cache = None
     if args.esm:
@@ -588,7 +613,6 @@ def main():
             epochs=args.epochs,
         )
         os.makedirs("checkpoints", exist_ok=True)
-        import json
         with open("checkpoints/cv_results.json", "w") as f:
             json.dump(cv_results, f, indent=2)
         print(f"\nSaved CV results to checkpoints/cv_results.json")
@@ -651,6 +675,23 @@ def main():
         "metrics": all_metrics,
     }
     torch.save(checkpoint, "checkpoints/meal_shield_gnn.pt")
+
+    results_payload = {
+        "config": {
+            "feature_dim": feature_dim,
+            "hidden_dim": args.hidden_dim,
+            "esm": args.esm,
+            "multitask": args.multitask,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+        },
+        "targets": target_names,
+        "metrics": all_metrics,
+    }
+    with open("checkpoints/results.json", "w") as f:
+        json.dump(results_payload, f, indent=2)
+    print(f"Saved metrics to checkpoints/results.json")
 
     # ---- Predict on food peptides ----
     print("\n" + "=" * 60)

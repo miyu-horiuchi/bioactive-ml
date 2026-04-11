@@ -177,8 +177,12 @@ def main():
     chembl_df = download_all_data()
     peptides = load_food_peptides()
 
+    # Keep only peptides whose target matches one of the 6 ChEMBL targets
+    allowed_targets = set(TARGETS.keys())
+    before = len(peptides)
+    peptides = [p for p in peptides if p["target"] in allowed_targets]
     print(f"ChEMBL records: {len(chembl_df)}")
-    print(f"Food peptides: {len(peptides)}")
+    print(f"Food peptides: {before} -> {len(peptides)} (filtered to ChEMBL targets)")
 
     # 2. Build graphs
     print("\n=== Building molecular graphs ===")
@@ -199,8 +203,8 @@ def main():
     gnn_time = time.time() - t0
     print(f"\nGNN training time: {gnn_time:.1f}s")
 
-    torch.save(gnn_model.state_dict(), "checkpoints/meal_shield_gnn.pt")
-    print("Saved: checkpoints/meal_shield_gnn.pt")
+    torch.save(gnn_model.state_dict(), "checkpoints/meal_shield_gnn_only.pt")
+    print("Saved: checkpoints/meal_shield_gnn_only.pt")
 
     # 4. Compute TDA features
     print("\n=== Computing TDA features ===")
@@ -209,7 +213,7 @@ def main():
         tda_cache = torch.load(tda_cache_path, weights_only=False)
         print(f"Loaded TDA cache: {len(tda_cache)} entries")
     else:
-        tda_cache = compute_tda_for_dataset(chembl_df, peptide_list)
+        tda_cache = compute_tda_for_dataset(chembl_df, peptides)
         torch.save(tda_cache, tda_cache_path)
         print(f"Computed and cached TDA features: {len(tda_cache)} entries")
 
@@ -237,7 +241,7 @@ def main():
 
     print("\n=== Done ===")
     print("Artifacts:")
-    print("  checkpoints/meal_shield_gnn.pt       (GNN model)")
+    print("  checkpoints/meal_shield_gnn_only.pt   (GNN-only baseline)")
     print("  checkpoints/meal_shield_gnn_tda.pt    (GNN+TDA model)")
     print("  checkpoints/comparison_results.json   (metrics)")
     print("  RESULTS.md                            (formatted results)")

@@ -14,25 +14,33 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.model_selection import train_test_split
 
 from model import MealShieldGNN, MealShieldGNN_TDA
-from data import download_all_data, KNOWN_FOOD_PEPTIDES, smiles_to_graph, peptide_to_graph
+from data import (
+    download_all_data,
+    load_food_peptides,
+    smiles_to_graph,
+    peptide_to_graph,
+    TARGETS,
+)
 from topology import compute_tda_for_dataset
-import pandas as pd
 
 
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def pad_features(graph, target_dim):
-    """Pad node features to target dimension."""
+    """Pad node features to target dimension. Strips non-tensor attrs
+    for batching but keeps _smiles/_sequence for TDA lookup."""
     if graph.x.shape[1] < target_dim:
         padding = torch.zeros(graph.x.shape[0], target_dim - graph.x.shape[1])
         graph.x = torch.cat([graph.x, padding], dim=1)
     elif graph.x.shape[1] > target_dim:
         graph.x = graph.x[:, :target_dim]
-    for attr in ['edge_attr', 'sequence', 'mol_type']:
+    for attr in ['edge_attr', 'sequence', 'mol_type', 'smiles']:
         if hasattr(graph, attr):
             delattr(graph, attr)
     return graph
@@ -51,8 +59,14 @@ def attach_tda_features(graphs, tda_cache, tda_dim=30):
     return graphs, success
 
 
-def build_graphs_with_keys(chembl_df, peptide_list, max_per_target=2000):
-    """Build graphs and store SMILES/sequence keys for TDA lookup."""
+def build_graphs_with_keys(chembl_df, peptide_list, max_per_target=2000,
+                           esm_cache=None):
+    """Build graphs and store SMILES/sequence keys for TDA cache lookup.
+
+    Mirrors data.build_dataset but preserves the raw key (SMILES for small
+    molecules, sequence for peptides) so that precomputed TDA features can
+    be attached later.
+    """
     graphs = []
 
     for target_name in chembl_df["target"].unique():
@@ -63,6 +77,7 @@ def build_graphs_with_keys(chembl_df, peptide_list, max_per_target=2000):
             if graph is not None:
                 graph.y = torch.tensor([row["pIC50"]], dtype=torch.float)
                 graph.target_name = target_name
+                graph.mol_type = "small_molecule"
                 graph._smiles = row["smiles"]
                 graphs.append(graph)
                 count += 1
@@ -71,10 +86,12 @@ def build_graphs_with_keys(chembl_df, peptide_list, max_per_target=2000):
     if peptide_list:
         pep_count = 0
         for pep in peptide_list:
-            graph = peptide_to_graph(pep["sequence"], use_residue_level=True)
+            graph = peptide_to_graph(pep["sequence"], use_residue_level=True,
+                                     esm_cache=esm_cache)
             if graph is not None:
                 graph.y = torch.tensor([pep["pIC50"]], dtype=torch.float)
                 graph.target_name = pep["target"]
+                graph.mol_type = "peptide"
                 graph._sequence = pep["sequence"]
                 graphs.append(graph)
                 pep_count += 1
@@ -94,7 +111,10 @@ def prepare_splits(graphs, target_name):
 
 
 def train_model(model, train_graphs, val_graphs, target_name, device,
-                epochs=150, lr=1e-3, batch_size=32, feature_dim=11):
+                epochs=150, lr=1e-3, batch_size=32, feature_dim=None):
+    if feature_dim is None:
+        dims = [g.x.shape[1] for g in train_graphs + val_graphs if g.x is not None]
+        feature_dim = max(dims) if dims else 11
     """Train a model on one target."""
     train_g = [pad_features(g, feature_dim) for g in train_graphs]
     val_g = [pad_features(g, feature_dim) for g in val_graphs]
@@ -153,7 +173,10 @@ def train_model(model, train_graphs, val_graphs, target_name, device,
     return model
 
 
-def run_evaluation(model, test_graphs, target_name, device, feature_dim=11):
+def run_evaluation(model, test_graphs, target_name, device, feature_dim=None):
+    if feature_dim is None:
+        dims = [g.x.shape[1] for g in test_graphs if g.x is not None]
+        feature_dim = max(dims) if dims else 11
     """Run evaluation on test set."""
     test_g = [pad_features(g, feature_dim) for g in test_graphs]
     loader = DataLoader(test_g, batch_size=64)
@@ -180,8 +203,25 @@ def run_evaluation(model, test_graphs, target_name, device, feature_dim=11):
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train Meal Shield GNN+TDA")
+    parser.add_argument("--esm", action="store_true",
+                        help="Use ESM-2 embeddings on peptides (larger feature dim)")
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    args = parser.parse_args()
+
     set_seed(42)
-    device = torch.device("cpu")
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # ---- Load data ----
@@ -189,31 +229,54 @@ def main():
     print("STEP 1: Loading data + computing TDA features")
     print("=" * 60)
 
-    chembl_df = pd.read_csv("data/chembl_combined.csv")
+    chembl_df = download_all_data(data_dir="data")
     print(f"ChEMBL records: {len(chembl_df)}")
 
-    print("\nBuilding molecular graphs...")
-    graphs = build_graphs_with_keys(chembl_df, KNOWN_FOOD_PEPTIDES)
+    peptides = load_food_peptides()
+    allowed_targets = set(TARGETS.keys())
+    before = len(peptides)
+    peptides = [p for p in peptides if p["target"] in allowed_targets]
+    print(f"Filtered peptides: {before} -> {len(peptides)} "
+          f"(kept targets: {sorted(allowed_targets)})")
+
+    esm_cache = None
+    if args.esm:
+        from esm_embeddings import compute_and_cache_embeddings
+        seqs = [p["sequence"] for p in peptides]
+        print(f"Loading ESM-2 embeddings for {len(set(seqs))} unique sequences...")
+        esm_cache = compute_and_cache_embeddings(seqs)
+
+    print("\nBuilding molecular graphs (with TDA key preservation)...")
+    graphs = build_graphs_with_keys(chembl_df, peptides, esm_cache=esm_cache)
     print(f"Total graphs: {len(graphs)}")
+
+    # Auto-detect feature dimension
+    feature_dims = set(g.x.shape[1] for g in graphs if g.x is not None)
+    feature_dim = max(feature_dims) if feature_dims else 11
+    print(f"Feature dimensions in dataset: {feature_dims} -> using {feature_dim}")
 
     # Compute TDA features
     tda_cache_file = "data/tda_cache.pt"
     if os.path.exists(tda_cache_file):
         print("\nLoading cached TDA features...")
-        tda_cache = torch.load(tda_cache_file)
+        tda_cache = torch.load(tda_cache_file, weights_only=False)
         print(f"  Loaded {len(tda_cache)} TDA features from cache")
     else:
         print("\nComputing persistent homology features (this takes a few minutes)...")
-        tda_cache = compute_tda_for_dataset(chembl_df, KNOWN_FOOD_PEPTIDES, method="statistics")
+        tda_cache = compute_tda_for_dataset(chembl_df, peptides, method="statistics")
         torch.save(tda_cache, tda_cache_file)
         print(f"  Saved {len(tda_cache)} TDA features to cache")
 
-    # Get targets with enough data
+    # Keep only targets that both (a) have enough graphs and (b) are in the
+    # allowed target set (matches train.py behavior).
     target_counts = {}
     for g in graphs:
         t = g.target_name
         target_counts[t] = target_counts.get(t, 0) + 1
-    targets = [t for t, c in target_counts.items() if c >= 20]
+    targets = sorted(
+        t for t, c in target_counts.items()
+        if c >= 20 and t in allowed_targets
+    )
     print(f"\nTargets: {targets}")
 
     # ---- Run comparison ----
@@ -238,13 +301,18 @@ def main():
         print(f"\n  [A] GNN-only:")
         set_seed(42)
         gnn_model = MealShieldGNN(
-            node_feature_dim=11, hidden_dim=128, num_heads=4,
+            node_feature_dim=feature_dim, hidden_dim=args.hidden_dim, num_heads=4,
             num_layers=3, dropout=0.2, target_names=targets,
         ).to(device)
 
-        gnn_model = train_model(gnn_model, train, val, target, device,
-                                 epochs=150, batch_size=min(32, len(train)))
-        gnn_metrics = run_evaluation(gnn_model, test, target, device)
+        gnn_model = train_model(
+            gnn_model, train, val, target, device,
+            epochs=args.epochs, lr=args.lr,
+            batch_size=min(args.batch_size, len(train)),
+            feature_dim=feature_dim,
+        )
+        gnn_metrics = run_evaluation(gnn_model, test, target, device,
+                                     feature_dim=feature_dim)
         comparison["gnn_only"][target] = gnn_metrics
         print(f"    R2 = {gnn_metrics['R2']}  |  RMSE = {gnn_metrics['RMSE']}")
 
@@ -257,13 +325,19 @@ def main():
         test_tda, _ = attach_tda_features(test, tda_cache)
 
         tda_model = MealShieldGNN_TDA(
-            node_feature_dim=11, tda_feature_dim=30, hidden_dim=128,
-            num_heads=4, num_layers=3, dropout=0.2, target_names=targets,
+            node_feature_dim=feature_dim, tda_feature_dim=30,
+            hidden_dim=args.hidden_dim, num_heads=4, num_layers=3,
+            dropout=0.2, target_names=targets,
         ).to(device)
 
-        tda_model = train_model(tda_model, train_tda, val_tda, target, device,
-                                 epochs=150, batch_size=min(32, len(train_tda)))
-        tda_metrics = run_evaluation(tda_model, test_tda, target, device)
+        tda_model = train_model(
+            tda_model, train_tda, val_tda, target, device,
+            epochs=args.epochs, lr=args.lr,
+            batch_size=min(args.batch_size, len(train_tda)),
+            feature_dim=feature_dim,
+        )
+        tda_metrics = run_evaluation(tda_model, test_tda, target, device,
+                                     feature_dim=feature_dim)
         comparison["gnn_tda"][target] = tda_metrics
         print(f"    R2 = {tda_metrics['R2']}  |  RMSE = {tda_metrics['RMSE']}")
 
@@ -305,16 +379,38 @@ def main():
 
     # Save
     os.makedirs("checkpoints", exist_ok=True)
+
+    results_payload = {
+        "config": {
+            "feature_dim": feature_dim,
+            "hidden_dim": args.hidden_dim,
+            "esm": args.esm,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "tda_method": "statistics",
+            "tda_feature_dim": 30,
+        },
+        "targets": targets,
+        "comparison": comparison,
+    }
+    with open("checkpoints/tda_results.json", "w") as f:
+        json.dump(results_payload, f, indent=2)
+
+    # Keep the legacy filename too so older tooling doesn't break.
     with open("checkpoints/comparison_results.json", "w") as f:
         json.dump(comparison, f, indent=2)
 
     torch.save({
         "model_state_dict": tda_model.state_dict(),
         "target_names": targets,
+        "feature_dim": feature_dim,
+        "hidden_dim": args.hidden_dim,
+        "esm_enabled": args.esm,
         "comparison": comparison,
     }, "checkpoints/meal_shield_gnn_tda.pt")
 
-    print(f"\nResults saved to checkpoints/comparison_results.json")
+    print(f"\nResults saved to checkpoints/tda_results.json")
     print(f"GNN+TDA model saved to checkpoints/meal_shield_gnn_tda.pt")
 
 
