@@ -68,17 +68,27 @@ def _load_models():
     if os.path.exists(CHECKPOINT_PATH):
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
 
-        # Support both old (raw state_dict) and new (metadata dict) checkpoint formats
+        # Support both wrapped (metadata dict) and bare (raw state_dict) formats.
+        # For bare state dicts, infer feature_dim from the input projection layer
+        # so a mismatched checkpoint never silently loads against the wrong model.
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             model_state = checkpoint["model_state_dict"]
-            feat_dim = checkpoint.get("feature_dim", 11)
+            feat_dim = checkpoint.get("feature_dim")
             hidden = checkpoint.get("hidden_dim", 128)
             targets = checkpoint.get("target_names", TARGET_NAMES)
+            esm_enabled = checkpoint.get("esm_enabled")
         else:
             model_state = checkpoint
-            feat_dim = 11
+            feat_dim = None
             hidden = 128
             targets = TARGET_NAMES
+            esm_enabled = None
+
+        if feat_dim is None:
+            ip = model_state.get("input_proj.weight")
+            feat_dim = int(ip.shape[1]) if ip is not None else 11
+        if esm_enabled is None:
+            esm_enabled = feat_dim > 11
 
         model = MealShieldGNN(
             node_feature_dim=feat_dim,
@@ -93,8 +103,10 @@ def _load_models():
         state["model"] = model
         state["feature_dim"] = feat_dim
         state["target_names"] = targets
+        state["esm_enabled"] = esm_enabled
         state["demo_mode"] = False
-        logger.info("Loaded GNN (feature_dim=%d, targets=%s)", feat_dim, targets)
+        logger.info("Loaded GNN (feature_dim=%d, esm=%s, targets=%s)",
+                    feat_dim, esm_enabled, targets)
 
     if os.path.exists(TDA_CHECKPOINT_PATH):
         feat_dim = state.get("feature_dim", 11)
@@ -139,13 +151,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
         "https://*.vercel.app",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"(https://.*\.vercel\.app|http://(localhost|127\.0\.0\.1):(3000|3001|3002|3003|3004|3005|3006))",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -286,7 +294,8 @@ def _real_predict(sequence: str) -> list[TargetPrediction]:
         state["model"], sequence,
         state.get("target_names", TARGET_NAMES),
         device,
-        feature_dim=state.get("feature_dim", 11)
+        feature_dim=state.get("feature_dim", 11),
+        use_esm=state.get("esm_enabled", False),
     )
     if results is None:
         raise HTTPException(422, "Could not build molecular graph for this sequence")

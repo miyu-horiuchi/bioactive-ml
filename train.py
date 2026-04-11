@@ -16,6 +16,8 @@ from sklearn.model_selection import train_test_split
 from model import MealShieldGNN, MealShieldGIN
 from data import download_all_data, build_dataset, KNOWN_FOOD_PEPTIDES, load_food_peptides, TARGETS
 
+NUM_WORKERS = min(4, os.cpu_count() or 1)
+
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -73,8 +75,10 @@ def train_single_target(model, train_graphs, val_graphs, target_name,
     train_graphs = collate_mixed(train_graphs, feature_dim)
     val_graphs = collate_mixed(val_graphs, feature_dim)
 
-    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_graphs, batch_size=batch_size) if val_graphs else None
+    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True,
+                              num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0)
+    val_loader = DataLoader(val_graphs, batch_size=batch_size,
+                            num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0) if val_graphs else None
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -157,7 +161,8 @@ def compute_metrics(all_trues, all_preds):
 def evaluate_target(model, test_graphs, target_name, device, feature_dim=11):
     """Evaluate model on test set for a specific target."""
     test_graphs = collate_mixed(test_graphs, feature_dim)
-    test_loader = DataLoader(test_graphs, batch_size=64)
+    test_loader = DataLoader(test_graphs, batch_size=64,
+                             num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0)
 
     model.eval()
     all_preds = []
@@ -214,8 +219,10 @@ def train_multitask(model, graphs, target_names, device,
     train_graphs = collate_mixed(train_graphs, feature_dim)
     val_graphs = collate_mixed(val_graphs, feature_dim)
 
-    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_graphs, batch_size=batch_size) if val_graphs else None
+    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True,
+                              num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0)
+    val_loader = DataLoader(val_graphs, batch_size=batch_size,
+                            num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0) if val_graphs else None
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -369,8 +376,10 @@ def cross_validate(graphs, target_names, device, n_folds=5,
         tr_padded = collate_mixed(tr, feature_dim)
         va_padded = collate_mixed(va, feature_dim)
 
-        train_loader = DataLoader(tr_padded, batch_size=32, shuffle=True)
-        val_loader = DataLoader(va_padded, batch_size=32) if va_padded else None
+        train_loader = DataLoader(tr_padded, batch_size=32, shuffle=True,
+                                  num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0)
+        val_loader = DataLoader(va_padded, batch_size=32,
+                                num_workers=NUM_WORKERS, persistent_workers=NUM_WORKERS > 0) if va_padded else None
 
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -544,9 +553,12 @@ def main():
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.__version__ >= "2.4":
+        # MPS scatter_reduce works reliably from PyTorch 2.4+
+        device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device} (PyTorch {torch.__version__})")
 
     # ---- Data ----
     print("\n" + "=" * 60)
@@ -599,6 +611,14 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
+
+    # torch.compile for ~30% speedup (PyTorch 2.x)
+    if hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+            print("torch.compile() enabled")
+        except Exception as e:
+            print(f"torch.compile() skipped: {e}")
 
     # ---- Cross-validation mode ----
     if args.cv > 0:
