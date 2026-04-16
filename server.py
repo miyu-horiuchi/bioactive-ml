@@ -543,7 +543,9 @@ async def explain(req: ExplainRequest):
     else:
         from interpret import explain_prediction
         result = explain_prediction(
-            state["model"], sequence, req.target, device, method=req.method
+            state["model"], sequence, req.target, device,
+            method=req.method,
+            feature_dim=state.get("feature_dim", 11),
         )
 
     if result is None:
