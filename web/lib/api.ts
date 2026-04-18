@@ -114,6 +114,65 @@ export async function explainPrediction(
   return res.json();
 }
 
+// ── Design pipeline types ──────────────────────────────────
+
+export interface DesignCandidate {
+  sequence: string;
+  pIC50: number;
+  IC50_uM: number;
+  solubility?: number;
+  toxicity?: number;
+  bitterness?: number;
+  hemolysis?: number;
+  stability?: number;
+  developability?: number;
+}
+
+export interface GenerateResponse {
+  target: string;
+  method: string;
+  candidates: DesignCandidate[];
+}
+
+export interface PropertiesResponse {
+  sequence: string;
+  properties: Record<string, number>;
+}
+
+export async function generatePeptides(
+  target: string,
+  method: string = "genetic",
+  length: number = 5,
+  n_candidates: number = 50,
+  top_k: number = 10,
+): Promise<GenerateResponse> {
+  const res = await fetch(`${BASE}/api/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, method, length, n_candidates, top_k }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Generation failed");
+  }
+  return res.json();
+}
+
+export async function scoreProperties(
+  sequence: string,
+): Promise<PropertiesResponse> {
+  const res = await fetch(`${BASE}/api/properties`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sequence }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Property scoring failed");
+  }
+  return res.json();
+}
+
 export function activityLevel(pIC50: number): "high" | "medium" | "low" {
   if (pIC50 >= 6.0) return "high";
   if (pIC50 >= 4.5) return "medium";

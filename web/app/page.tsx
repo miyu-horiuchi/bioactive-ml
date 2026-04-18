@@ -5,6 +5,7 @@ import PeptideInput from "@/components/PeptideInput";
 import PredictionResults from "@/components/PredictionResults";
 import MoleculeViewer from "@/components/MoleculeViewer";
 import AttributionViewer from "@/components/AttributionViewer";
+import DesignPanel from "@/components/DesignPanel";
 import {
   predictPeptide,
   explainPrediction,
@@ -13,6 +14,7 @@ import {
 } from "@/lib/api";
 
 export default function Home() {
+  const [tab, setTab] = useState<"predict" | "design">("design");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<PredictResponse | null>(null);
   const [explanation, setExplanation] = useState<ExplainResponse | null>(null);
@@ -60,6 +62,46 @@ export default function Home() {
 
   return (
     <div className="space-y-8">
+      {/* Tab navigation */}
+      <div className="flex gap-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-1">
+        <button
+          onClick={() => setTab("design")}
+          className={`flex-1 rounded-md px-4 py-2.5 text-sm font-medium transition ${
+            tab === "design"
+              ? "bg-[var(--color-accent)] text-white"
+              : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+          }`}
+        >
+          Design Peptides
+        </button>
+        <button
+          onClick={() => setTab("predict")}
+          className={`flex-1 rounded-md px-4 py-2.5 text-sm font-medium transition ${
+            tab === "predict"
+              ? "bg-[var(--color-accent)] text-white"
+              : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+          }`}
+        >
+          Predict Activity
+        </button>
+      </div>
+
+      {tab === "design" && (
+        <>
+          <section>
+            <h2 className="text-2xl font-bold">AI Peptide Design</h2>
+            <p className="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
+              Select a biological function and the AI will design novel peptide
+              sequences optimized for that target, scored on safety, solubility,
+              and taste — with predicted 3D structures.
+            </p>
+          </section>
+          <DesignPanel />
+        </>
+      )}
+
+      {tab === "predict" && (
+        <>
       {/* Hero */}
       <section>
         <h2 className="text-2xl font-bold">Peptide Bioactivity Prediction</h2>
@@ -140,6 +182,8 @@ export default function Home() {
             </p>
           </div>
         </section>
+      )}
+        </>
       )}
     </div>
   );
